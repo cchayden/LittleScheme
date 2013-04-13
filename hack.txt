@@ -1,0 +1,320 @@
+
+                              How to extend LittleScheme
+                              --------------------------
+
+     TinyScheme is easy to learn and modify. It is structured like a
+     meta-interpreter, only it is written in C++. It uses some of the C++
+	 standard library, such as string and vector, to simplify the code.
+
+     Instead of describing how the interpreter works, this note describes how
+	 to extend the interpreter to provide an extension for your application.
+	 LittleScheme was changed relative to TinyScheme to make it possible to
+	 extend with as little change to the existing files as possbible.
+
+	 As an example, we will describe how to add a new datatype: garbage-collected
+	 memory blocks.  This means the lock holds a block of objects (like a vector)
+	 that must be scanned for objects in the garbage collection process.
+
+<is this garbage collected or not ??>
+
+     The interface will be:
+
+          (make-block <n> [<fill>]) makes a new block of integers of the 
+               specified size optionally filling it with a specified value
+          (block? <obj>)
+          (block-length <block>)
+          (block-ref <block> <index>) retrieves integer at index
+          (block-set! <block> <index> <int>) modifies integer at index
+     
+	 The interpreter consists of two central classes: cell and scheme.  Cell
+	 is the basic scheme data unit, storing a number, a port, a car/cdr pair, 
+	 a continuation, etc.  In addition to the primary data is a type descriptor
+	 that indicates what is stored in the cell and a set of flags.  The cell class
+	 contains the storage and a set of functions that manipulate it in ways that
+	 are governed by the type descriptor and flags.  
+
+	 First, we need to decide if a new cell type is required.  If you will simply
+	 be adding additional primitives that make use of existing cell types, then you
+	 can skip this step.  In the case of memory blocks,  new cell type is required.
+	 Since there is no obvious way to use a subclass to add a new element to a
+	 union, we need to directly modify the class.
+
+     In the following, lines that begin with '>' denote lines to add to the
+     code. Lines that begin with '|' are just citations of existing code.
+
+     We make a new union entry at the very end of the cell class declaration:  
+
+|	 stack_frame* frame_;
+|    foreign_func ff_;
+>         struct {
+>              int*   mvalue_;
+>              int     mlen_;
+>         } memblk;
+|    } object;
+
+
+	 Everything else that we need to add is done in a new file.
+
+	 First declare a new class:
+
+>	 class cell_memblock : public cell {
+>	 ...
+>	 };
+
+
+     Next, we need to assign a typeid to our new type. Typeids
+     in LittleScheme are characters declared in the enum cell_type, in 
+     class cell.  Pick a new one that is not already used.
+	 By convention, lowercase is used for atoms, upper case for cells 
+	 containing pointers.  
+
+>	 enum {
+>		T_MEMBLOCK =	    'b',	///<	stores a block
+>	 };
+
+
+	 Next, write the function that creates a memory block.  This gets a free
+	 cell, sets the T_MEMBLOCK flag, allocates the actual block, and stores the
+	 pointer and length in the cell.
+
+>	 pointer scheme_memblock::mk_memblock(int len, int fill) {
+>		mem_pointer x = (mem_pointer)store_.find_cell();
+>		int* p = new int[len];
+>		for (int i = 0; i < len; i++) p[i] = fill;
+>		x->set_memblock(p, len);
+>		return x;
+>	 }
+
+     It is convenient to write accesor functions that return the memory block
+     address and length.  See strvalue and strlength.  
+
+>	 int* memvalue() const { 
+>#if CHECK
+>		assert(is_memblock());
+>#endif
+>		return object.memblk.mvalue_; 
+>	 }
+>
+>	 int memlen() const { 
+>#if CHECK
+>		assert(is_memblock());
+>#endif
+>		return object.memblk.mlen_; 
+>	 }
+
+     Some helper functions are useful. These let you call memory block functions
+	 given only a pointer, without having to use the cell member syntax.
+
+>	 bool is_memblock(pointer p) { return ((mem_pointer)p)->is_memblock(); }
+>	 int* memvalue(pointer p) { return ((mem_pointer)p)->memvalue(); }
+>	 int memlen(pointer p) { return ((mem_pointer)p)->memlen(); }
+
+     We also need to write set_memblock to make an empty cell into a memblk cell.  
+     This would look like the following.  If F_ATOM is set, the the cell is not
+	 searched for references.  If not, then it is assumed to contain two references,
+	 in the car and crd fields of the cell.  If it does not follow either model, then
+	 F_ATOM is set (to disable normal marking) and a custom mark function is supplied.
+	 If the cell allocates auxillary storage that needs to be freed when the cell itself
+	 is freed, then a custom finalizer is also supplied.  Both a custom mark and
+	 finalizer are illustrated here.  
+
+>	 void set_memblk(int* mvalue, int mlen) { 
+>		type_ = T_MEMBLOCK;
+>		flag_ = F_ATOM | F_MARKFUN | F_FINALFUN;
+>		object.memblk.mvalue_ = mvalue;	
+>		object.memblk.mlen_ = mlen;
+>	 }
+
+     If you define a new cell type that does not need to be marked, then you
+	 would add
+
+>	    flag_ = F_ATOM;
+
+	 This would result in the garbage collector skipping memblock when it is looking for
+	 cells that are in use.
+
+	 The mark function simply goes through the memory block, calling the 
+	 basic mark function on every reference it finds, as follows.
+	 
+>	 static void mark_memblock(storage& st, pointer p) {
+>	 	int* mvalue = ((mem_pointer)p)->memvalue();
+>		int mlen = ((mem_pointer)p)->memlen();
+>		for (int i = 0; i < mlen; i++) {
+>			st.mark((pointer)mvalue[i]);
+>		}
+>	}
+
+	The custom mark function is introduced using a mark_entry structure
+	that is built as follows.  Later we will see how this is passed to the
+	interpreter.
+
+>	 //	mark table
+>	 static storage::mark_entry static_markers[] = {
+>		storage::mark_entry(cell_memblock::T_MEMBLOCK, mark_memblock),
+>		storage::mark_entry(0, 0),
+>	 };
+
+	 The finalizer is defined and introduced similarly.
+
+>	 static void finalize_memblock(storage& st, pointer p) { 
+>		delete [] ((mem_pointer)p)->memvalue();
+>	 }
+
+>	 static storage::final_entry static_finalizers[] = {
+>		storage::final_entry(cell_memblock::T_MEMBLOCK, finalize_memblock),
+>		storage::final_entry(0, 0),
+>	 };
+
+	 The built-in operations can test their argument types to make sure they are
+	 legal.  Block-length, block-ref, and block-set! all require arguments that
+	 are blocks.  A test function is needed to make this test.  It is introduced
+	 through a similar table.
+
+>#define TST_BLOCK   15
+>
+>	 static scheme::test_entry static_tests[] = {
+>	    scheme::test_entry(TST_BLOCK, is_memblock, "block"),
+>	    scheme::test_entry(-1, 0, 0)
+>	 };
+
+	 The new cell type needs its own print routine.  For memory blocks we 
+	 will simply print that it is memory block.  And again, we will introduce
+	 the print routine with its own struct.
+
+>	 static const char* print_memblock(scheme&, pointer, bool, int, char*) { 
+>	 	return "#<MEMBLK>"; 
+>	 }
+>
+>	 static scheme::print_entry static_print[] = {
+>		scheme::print_entry(cell_memblock::T_MEMBLOCK, print_memblock),
+>		scheme::print_entry(0, 0),
+>	 };
+
+     Whenever a MEMBLOCK is displayed, it will look like that.
+
+
+	 Scheme reads an s-expression and stores it in the form of a list structure that
+	 can be interpreted directly.  Built-in special syntax and primitives are stored
+	 as interpreter operation codes that the interpreter can execute.  As interpretation
+	 proceeds, the structure may be modified, as directed by the individual operations.
+
+	 The main loop of the interpreter is driver by a table containing the operation
+	 name, its argument-processing and checking directions, and a pointer to C++
+	 code to execute the operation.  This table is built within the interpreter instance,
+	 and can be constructed based on statically-stored tables of various kinds.  The
+	 base interpreter uses a single table containing all the standard operations, but
+	 extensions can add new operations in a couple of ways.  The op code table is 
+	 organized as a vector of tables, each of which contains op_code_entry entries.
+	 The base interpreter uses element 0 of this vector, and each extension uses
+	 another vector element.  An op code (of type Op) stores both the vector position
+	 and the offset with each table of a specific operation.  Each table is indexed
+	 from 0, and is sized to hold the largest offset value, so it is best to use 
+	 consecutive values starting with 0, but it not necessary.  As the vector of tables
+	 is built, vector positions are assigned sequentially, so you don't have to 
+	 allocate these.
+
+	 This will illustrate the simplest way to add op codes, letting the system
+	 pick op code values.  You set up the op code table using a static structure 
+	 as follows.
+
+>	 static op_code_ent<scheme_memblk> static_entry[] = {
+>		op_code_ent<scheme_memblk>(-1, op_code_entry::proc, scheme_memblk::op_mkblock, 
+>		   "make-block", 1, 2, TST_NATURAL, TST_INTEGER),
+>		op_code_ent<scheme_memblk>(-1, op_code_entry::proc, scheme_memblk::op_blocklen, 
+>		   "block-len", 1, 1, TST_BLOCK),
+>		op_code_ent<scheme_memblk>(-1, op_code_entry::proc, scheme_memblk::op_blockref, 
+>		   "block-ref", 2, 2, TST_BLOCK, TST_NATURAL),
+>		op_code_ent<scheme_memblk>(-1, op_code_entry::proc, scheme_memblk::op_blockset, 
+>		   "block-set!", 3, 3, TST_BLOCK TST_NATURAL TST_INTEGER),
+>		op_code_ent<scheme_memblk>(-1, op_code_entry::proc, scheme_memblk::op_blockp, 
+>		   "block?", 1, 1, TST_ANY),
+>		op_code_ent<scheme_memblk>(Op::ILLEGAL, op_code_entry::prim, 0, "")
+>	 };
+
+	 In this table, the first item is the op code offset value.  If you use
+	 -1 the interpreter picks the next available op code offset value.  This way you 
+	 don't have to worry about holes or duplicates.  But if you need the value for
+	 explicit use elsewhere, you can supply a value.
+	 The rest of the entries describe the operation as a proc (which evaluates its
+	 arguments) or a prim (which does not), supply a member function pointer, the
+	 operation name, the minimum and maximum number of arguments, and the argument
+	 types.  the last entry is used to signal the end of the tale.
+
+	 Before the interpreter gets started, the custom mark, finalizer, test, and 
+	 opcodes need to be added.  This is accomplished by making a class derived from
+	 scheme and initializing things in the constructor. 
+
+>	 scheme_memblock::scheme_memblock(int first_cell_seg, 
+>				 int max_cell_seg): 
+>		scheme(first_cell_seg, max_cell_seg) {
+>
+>		bool ok = extend_tests(static_tests);
+>		int n = op_table_.extend(static_entry, this);
+>		store_.extend_marker(static_markers);
+>		store_.extend_finalizer(static_finalizers);
+>		extend_print(static_print);
+>	 }
+
+>	 class scheme_memblk : public scheme {
+>	 };
+
+
+
+     Finally you can define the operations.  Since all the scheme 
+	 varibles and functions are accessible to subclasses, you can look
+	 at any of the scheme operations as models.
+
+	 The declaration looks like the following.
+
+>	 public:
+>		 scheme_memblk(int first_cell_seg, int max_cell_seg);
+>	     void op_mkblock(scheme& sc);
+>	     void op_blocklen(scheme& sc);
+>	     void op_blockref(scheme& sc);
+>	     void op_blockset(scheme& sc);
+>	     void op_blockp(scheme& sc);
+
+	  Then the definition is thus.
+
+>     void scheme_memblk::op_mkblock(scheme& sc) {
+>          int len = ivalue(arg0());	// already verified nonneg integer
+>          int fill = 0;
+>          if (arg_tail() != NIL_) {
+>               fill = ivalue(arg1());
+>          }
+>          s_return(mk_memblock(len, fill));
+>     }
+>
+>     void scheme_memblk::op_blocklen(scheme& sc) {
+>          s_return(mk_integer(memlen(arg0())));
+>	  }
+>
+>     void scheme_memblk::op_blockref(scheme& sc) {
+>          int* mem = memvalue(arg0());  // guaranteed it is a block
+>          int index = ivalue(arg1());    // guaranteed it is nonneg integer    
+>          if(index >= memlen(arg0())) {
+>               s_error1("block-ref: out of bounds:", arg1());
+>          }
+>          s_return(mk_integer(mem[index]));
+>     }
+>
+>     void scheme_memblk::op_blockset(scheme& sc) {
+>          if(is_immutable(arg0())) {
+>               s_error1("block-set!: unable to alter immutable memory block:", arg0());
+>          }
+>          int* mem = memvalue(arg0());	// guaranteed to be block
+>          int index=ivalue(arg1());    // guaranteed to be nonneg
+>          if(index >= memlen(arg0())) {
+>               s_error1("block-set: out of bounds:", arg1());
+>          }
+>          mem[index] = ivalue(arg2());   // guaranteed to be integer
+>          s_return(VOID_);
+>     }
+
+>     void scheme_memblk::op_blockp(scheme& sc) {
+>       s_retbool(is_memblk(arg0()));
+>     }
+
+
+	 All of this is collected in the scheme_memblk.h and scheme_memblk.cpp
+	 files included with LittleScheme.
